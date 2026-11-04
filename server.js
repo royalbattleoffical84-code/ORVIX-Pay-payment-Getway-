@@ -11,8 +11,22 @@ const PORT = process.env.PORT || 3000;
 const gate = new fam.AccountGate({breakerThreshold:3, breakerPauseMs:600000});
 const cfg = {lookbackDays:3,maxFetch:15,maxMailBytes:3000000,imapTimeoutMs:20000,requireAuth:true};
 function auth(req,res,next) {
-  const got = String(req.headers.authorization || '').replace(/^Bearer\s+/i,'');
-  if (!API_KEY || !got || !crypto.timingSafeEqual(Buffer.from(got),Buffer.from(API_KEY))) return res.status(401).json({ok:false,error:'unauthorized'});
+  const got = String(req.headers.authorization || '').replace(/^Bearer\s+/i,'').trim();
+  const expected = String(API_KEY || '').trim();
+  const gotBuffer = Buffer.from(got, 'utf8');
+  const expectedBuffer = Buffer.from(expected, 'utf8');
+
+  // timingSafeEqual throws RangeError when buffer lengths differ.
+  // Check both buffers are non-empty and equal length before comparing.
+  if (
+    gotBuffer.length === 0 ||
+    expectedBuffer.length === 0 ||
+    gotBuffer.length !== expectedBuffer.length ||
+    !crypto.timingSafeEqual(gotBuffer, expectedBuffer)
+  ) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+
   next();
 }
 function valid(body) {
@@ -67,25 +81,26 @@ app.post('/v1/recent',auth,async(req,res)=>{
  }catch(e){res.status(502).json({ok:false,error:/auth|password|login/i.test(String(e.message))?'imap_login_failed':'imap_connection_failed'});}
 });
 
+
 // AI Assistant proxy (Gemini). Uses the same private bearer key as the IMAP bridge.
 app.post('/v1/ai-chat', auth, async (req, res) => {
   try {
     const geminiKey = process.env.GEMINI_API_KEY || '';
-    const model = String(req.body && req.body.model || process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
+    const model = String((req.body && req.body.model) || process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
     const messages = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
-    if (!geminiKey) return res.status(503).json({ok:false,error:'ai_not_configured'});
-    if (!messages.length || messages.length > 13) return res.status(400).json({ok:false,error:'invalid_messages'});
+    if (!geminiKey) return res.status(503).json({ ok: false, error: 'ai_not_configured' });
+    if (!messages.length || messages.length > 13) return res.status(400).json({ ok: false, error: 'invalid_messages' });
     const safeMessages = messages.map(m => ({
       role: m && m.role === 'assistant' ? 'assistant' : 'user',
-      content: String(m && m.content || '').slice(0, 4000)
+      content: String((m && m.content) || '').slice(0, 4000)
     })).filter(m => m.content.trim());
     if (!safeMessages.length || safeMessages[safeMessages.length - 1].role !== 'user') {
-      return res.status(400).json({ok:false,error:'invalid_messages'});
+      return res.status(400).json({ ok: false, error: 'invalid_messages' });
     }
     const upstream = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
       method: 'POST',
-      headers: {'Content-Type':'application/json','Authorization':'Bearer '+geminiKey},
-      body: JSON.stringify({model, temperature:0.4, messages:safeMessages}),
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + geminiKey },
+      body: JSON.stringify({ model, temperature: 0.4, messages: safeMessages }),
       signal: AbortSignal.timeout(40000)
     });
     const raw = await upstream.text();
@@ -93,13 +108,13 @@ app.post('/v1/ai-chat', auth, async (req, res) => {
     try { data = JSON.parse(raw); } catch (_) {}
     const reply = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
     if (!upstream.ok || typeof reply !== 'string' || !reply.trim()) {
-      console.error('AI provider error', upstream.status, String(data.error && data.error.message || 'empty response').slice(0,180));
-      return res.status(502).json({ok:false,error:upstream.status===401||upstream.status===403?'ai_key_invalid':'ai_provider_error'});
+      console.error('AI provider error', upstream.status, String((data.error && data.error.message) || 'empty response').slice(0, 180));
+      return res.status(502).json({ ok: false, error: upstream.status === 401 || upstream.status === 403 ? 'ai_key_invalid' : 'ai_provider_error' });
     }
-    return res.json({ok:true,reply});
+    return res.json({ ok: true, reply });
   } catch (e) {
-    console.error('AI proxy error:', String(e && e.message || e).slice(0,180));
-    return res.status(502).json({ok:false,error:'ai_upstream_unreachable'});
+    console.error('AI proxy error:', String((e && e.message) || e).slice(0, 180));
+    return res.status(502).json({ ok: false, error: 'ai_upstream_unreachable' });
   }
 });
 
