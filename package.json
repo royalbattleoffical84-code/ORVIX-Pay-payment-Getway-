@@ -1,0 +1,16 @@
+{
+  "name": "orvix-gmail-imap-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "imapflow": "^1.0.181",
+    "mailparser": "^3.7.2"
+  }
+}
