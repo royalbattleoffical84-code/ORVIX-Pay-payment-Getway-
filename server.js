@@ -5,7 +5,7 @@ const { simpleParser } = require('mailparser');
 const fam = require('./famMail');
 
 const app = express();
-app.use(express.json({limit:'32kb'}));
+app.use(express.json({limit:'32kb', verify:(req,res,buf)=>{ req.rawBody = buf; }}));
 const API_KEY = process.env.ORVIX_IMAP_API_KEY || '';
 const PORT = process.env.PORT || 3000;
 const gate = new fam.AccountGate({breakerThreshold:3, breakerPauseMs:600000});
@@ -216,4 +216,27 @@ app.post('/v1/ai-chat', auth, async (req, res) => {
   return res.status(502).json({ ok: false, error: lastError });
 });
 
+
+// Create-order relay: InfinityFree sends the FamApi "create order" call here; Render forwards it to FamApi.
+// Only POST /api/v1/orders is allowed. The FamApi key is forwarded from the PHP request header (not stored here).
+app.post('/v1/fam-create-order', auth, async (req, res) => {
+  const famKey = String(req.headers['x-famapi-key'] || '').trim();
+  if (!famKey) return res.status(400).json({ success: false, error: { code: 'NO_KEY', message: 'Missing X-FamApi-Key' } });
+  const famBase = String(process.env.FAMAPI_BASE || 'https://famapi-orcin.vercel.app').replace(/\/+$/, '');
+  try {
+    const upstream = await fetch(famBase + '/api/v1/orders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-FamApi-Key': famKey },
+      body: JSON.stringify(req.body || {}),
+      signal: AbortSignal.timeout(20000)
+    });
+    const text = await upstream.text();
+    res.status(upstream.status).type('application/json').send(text);
+  } catch (e) {
+    console.error('fam-create-order error:', String((e && e.message) || e).slice(0, 160));
+    res.status(502).json({ success: false, error: { code: 'RELAY_FAILED', message: 'Relay could not reach FamApi' } });
+  }
+});
+
+require('./api')(app);
 app.listen(PORT,'0.0.0.0',()=>console.log('ORVIX Gmail IMAP bridge listening on '+PORT));
