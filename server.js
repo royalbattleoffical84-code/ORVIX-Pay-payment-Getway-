@@ -135,9 +135,9 @@ app.post('/v1/ai-chat', auth, async (req, res) => {
 
   const fallbackModel = String(process.env.GEMINI_FALLBACK_MODEL || '').trim()
     .replace(/^models\//i, '').replace(/^\/+|\/+$/g, '');
-  // Order of tries: main model twice, then fallback model (if set) twice.
+  // Order of tries: alternate main and fallback so a slow/busy model is skipped quickly.
   const plan = fallbackModel && fallbackModel !== model
-    ? [model, model, fallbackModel, fallbackModel]
+    ? [model, fallbackModel, model, fallbackModel]
     : [model, model, model];
 
   // Total budget must stay below PHP's cURL timeout (75s).
@@ -159,7 +159,7 @@ app.post('/v1/ai-chat', auth, async (req, res) => {
           'x-goog-api-key': geminiKey
         },
         body: JSON.stringify(bodyFor()),
-        signal: AbortSignal.timeout(Math.min(25000, remaining))
+        signal: AbortSignal.timeout(Math.min(18000, remaining))
       });
 
       const raw = await upstream.text();
