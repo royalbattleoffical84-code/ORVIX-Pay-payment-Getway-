@@ -129,7 +129,7 @@ app.post('/v1/ai-chat', auth, async (req, res) => {
     + encodeURIComponent(model) + ':generateContent';
 
   // Retry only temporary rate-limit/overload responses once.
-  const maxAttempts = 2;
+  const maxAttempts = 2; // one retry for temporary 429/503 overload only
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const upstream = await fetch(endpoint, {
@@ -139,7 +139,7 @@ app.post('/v1/ai-chat', auth, async (req, res) => {
           'x-goog-api-key': geminiKey
         },
         body: JSON.stringify(requestBody),
-        signal: AbortSignal.timeout(35000)
+        signal: AbortSignal.timeout(60000)
       });
 
       const raw = await upstream.text();
