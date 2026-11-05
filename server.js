@@ -125,12 +125,24 @@ app.post('/v1/ai-chat', auth, async (req, res) => {
     };
   }
 
-  const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/'
-    + encodeURIComponent(model) + ':generateContent';
+  const fallbackModel = String(process.env.GEMINI_FALLBACK_MODEL || '').trim()
+    .replace(/^models\//i, '').replace(/^\/+|\/+$/g, '');
+  // Order of tries: main model twice, then fallback model (if set) twice.
+  const plan = fallbackModel && fallbackModel !== model
+    ? [model, model, fallbackModel, fallbackModel]
+    : [model, model, model];
 
-  // Retry only temporary rate-limit/overload responses once.
-  const maxAttempts = 2; // one retry for temporary 429/503 overload only
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  // Total budget must stay below PHP's cURL timeout (75s).
+  const deadline = Date.now() + 60000;
+  let lastError = 'ai_provider_busy';
+
+  for (let i = 0; i < plan.length; i++) {
+    const remaining = deadline - Date.now();
+    if (remaining < 4000) break;
+    const m = plan[i];
+    const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/'
+      + encodeURIComponent(m) + ':generateContent';
+
     try {
       const upstream = await fetch(endpoint, {
         method: 'POST',
@@ -139,7 +151,7 @@ app.post('/v1/ai-chat', auth, async (req, res) => {
           'x-goog-api-key': geminiKey
         },
         body: JSON.stringify(requestBody),
-        signal: AbortSignal.timeout(60000)
+        signal: AbortSignal.timeout(Math.min(25000, remaining))
       });
 
       const raw = await upstream.text();
@@ -151,7 +163,7 @@ app.post('/v1/ai-chat', auth, async (req, res) => {
         ? data.candidates[0].content.parts.map(part => part && part.text || '').join('')
         : '';
 
-      if (upstream.ok && typeof reply === 'string' && reply.trim()) {
+      if (upstream.ok && reply.trim()) {
         return res.json({ ok: true, reply: reply.trim() });
       }
 
@@ -160,34 +172,34 @@ app.post('/v1/ai-chat', auth, async (req, res) => {
         : (data && data.promptFeedback && data.promptFeedback.blockReason)
           ? 'Prompt blocked: ' + data.promptFeedback.blockReason
           : 'empty response';
+      console.error('AI provider error', m, upstream.status, String(providerMessage).slice(0, 240));
 
-      console.error('AI provider error', upstream.status, String(providerMessage).slice(0, 240));
-
-      if ((upstream.status === 429 || upstream.status === 503) && attempt < maxAttempts) {
-        await new Promise(resolve => setTimeout(resolve, 1500));
+      // Bad key: retrying is pointless.
+      if (upstream.status === 401 || upstream.status === 403) {
+        return res.status(502).json({ ok: false, error: 'ai_key_invalid' });
+      }
+      // Model missing: skip remaining tries of the same model.
+      if (upstream.status === 404) {
+        lastError = 'ai_model_or_endpoint_not_found';
+        while (i + 1 < plan.length && plan[i + 1] === m) i++;
         continue;
       }
-
-      return res.status(502).json({
-        ok: false,
-        error: upstream.status === 401 || upstream.status === 403
-          ? 'ai_key_invalid'
-          : upstream.status === 404
-            ? 'ai_model_or_endpoint_not_found'
-            : upstream.status === 429 || upstream.status === 503
-              ? 'ai_provider_busy'
-              : 'ai_provider_error'
-      });
+      // Temporary problems: wait a bit and try again.
+      if ([429, 500, 503, 504].includes(upstream.status) || upstream.ok) {
+        lastError = 'ai_provider_busy';
+        await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+        continue;
+      }
+      lastError = 'ai_provider_error';
+      break;
     } catch (e) {
       const message = String((e && e.message) || e);
-      console.error('AI proxy error:', message.slice(0, 180));
-      return res.status(502).json({
-        ok: false,
-        error: /timeout|aborted/i.test(message) ? 'ai_provider_timeout' : 'ai_upstream_unreachable'
-      });
+      console.error('AI proxy error:', m, message.slice(0, 180));
+      lastError = /timeout|aborted/i.test(message) ? 'ai_provider_timeout' : 'ai_upstream_unreachable';
+      // timeout/network: try next in plan if time remains
     }
   }
-  return res.status(502).json({ ok: false, error: 'ai_provider_busy' });
+  return res.status(502).json({ ok: false, error: lastError });
 });
 
 app.listen(PORT,'0.0.0.0',()=>console.log('ORVIX Gmail IMAP bridge listening on '+PORT));
