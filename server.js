@@ -119,6 +119,14 @@ app.post('/v1/ai-chat', auth, async (req, res) => {
     contents,
     generationConfig: { temperature: 0.4 }
   };
+  // Faster replies: lower "thinking" effort. Set GEMINI_THINKING_LEVEL=off to disable this.
+  const thinkingLevel = String(process.env.GEMINI_THINKING_LEVEL || 'low').trim().toLowerCase();
+  let useThinkingCfg = thinkingLevel && thinkingLevel !== 'off';
+  const bodyFor = () => {
+    const b = JSON.parse(JSON.stringify(requestBody));
+    if (useThinkingCfg) b.generationConfig.thinkingConfig = { thinkingLevel };
+    return b;
+  };
   if (systemMessages.length) {
     requestBody.systemInstruction = {
       parts: [{ text: systemMessages.join('\n\n') }]
@@ -150,7 +158,7 @@ app.post('/v1/ai-chat', auth, async (req, res) => {
           'Content-Type': 'application/json',
           'x-goog-api-key': geminiKey
         },
-        body: JSON.stringify(requestBody),
+        body: JSON.stringify(bodyFor()),
         signal: AbortSignal.timeout(Math.min(25000, remaining))
       });
 
@@ -174,6 +182,12 @@ app.post('/v1/ai-chat', auth, async (req, res) => {
           : 'empty response';
       console.error('AI provider error', m, upstream.status, String(providerMessage).slice(0, 240));
 
+      // Model rejected thinking setting: drop it and retry immediately.
+      if (upstream.status === 400 && useThinkingCfg && /thinking/i.test(String(providerMessage))) {
+        useThinkingCfg = false;
+        i--;
+        continue;
+      }
       // Bad key: retrying is pointless.
       if (upstream.status === 401 || upstream.status === 403) {
         return res.status(502).json({ ok: false, error: 'ai_key_invalid' });
