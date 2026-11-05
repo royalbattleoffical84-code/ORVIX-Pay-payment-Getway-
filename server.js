@@ -16,8 +16,6 @@ function auth(req,res,next) {
   const gotBuffer = Buffer.from(got, 'utf8');
   const expectedBuffer = Buffer.from(expected, 'utf8');
 
-  // timingSafeEqual throws RangeError when buffer lengths differ.
-  // Check both buffers are non-empty and equal length before comparing.
   if (
     gotBuffer.length === 0 ||
     expectedBuffer.length === 0 ||
@@ -82,88 +80,114 @@ app.post('/v1/recent',auth,async(req,res)=>{
 });
 
 
-// AI Assistant proxy (Gemini). Uses the same private bearer key as the IMAP bridge.
+// AI Assistant proxy (Gemini). IMAP and other routes above remain unchanged.
 app.post('/v1/ai-chat', auth, async (req, res) => {
-  try {
-    const geminiKey = process.env.GEMINI_API_KEY || '';
-    const model = String((req.body && req.body.model) || process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
-    const messages = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
-    if (!geminiKey) return res.status(503).json({ ok: false, error: 'ai_not_configured' });
-    if (!messages.length || messages.length > 13) return res.status(400).json({ ok: false, error: 'invalid_messages' });
+  const geminiKey = process.env.GEMINI_API_KEY || '';
+  // Prefer Render's environment value so an old model sent by PHP cannot override it.
+  let model = String(process.env.GEMINI_MODEL || (req.body && req.body.model) || 'gemini-3.8-flash').trim();
+  model = model.replace(/^models\//i, '').replace(/^\/+|\/+$/g, '');
 
-    // Convert chat messages to Gemini's native generateContent format.
-    const systemMessages = [];
-    const contents = [];
-    for (const m of messages) {
-      const role = String((m && m.role) || 'user').toLowerCase();
-      const content = String((m && m.content) || '').slice(0, 4000).trim();
-      if (!content) continue;
-      if (role === 'system' || role === 'developer') {
-        systemMessages.push(content);
-      } else {
-        contents.push({
-          role: role === 'assistant' ? 'model' : 'user',
-          parts: [{ text: content }]
-        });
-      }
+  if (!geminiKey) return res.status(503).json({ ok: false, error: 'ai_not_configured' });
+
+  const messages = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
+  if (!messages.length || messages.length > 13) {
+    return res.status(400).json({ ok: false, error: 'invalid_messages' });
+  }
+
+  const systemMessages = [];
+  const contents = [];
+  for (const m of messages) {
+    const role = String((m && m.role) || 'user').toLowerCase();
+    const content = String((m && m.content) || '').slice(0, 4000).trim();
+    if (!content) continue;
+
+    if (role === 'system' || role === 'developer') {
+      systemMessages.push(content);
+    } else {
+      contents.push({
+        role: role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: content }]
+      });
     }
+  }
 
-    if (!contents.length || contents[contents.length - 1].role !== 'user') {
-      return res.status(400).json({ ok: false, error: 'invalid_messages' });
-    }
+  if (!contents.length || contents[contents.length - 1].role !== 'user') {
+    return res.status(400).json({ ok: false, error: 'invalid_messages' });
+  }
 
-    const requestBody = {
-      contents,
-      generationConfig: { temperature: 0.4 }
+  const requestBody = {
+    contents,
+    generationConfig: { temperature: 0.4 }
+  };
+  if (systemMessages.length) {
+    requestBody.systemInstruction = {
+      parts: [{ text: systemMessages.join('\n\n') }]
     };
-    if (systemMessages.length) {
-      requestBody.systemInstruction = {
-        parts: [{ text: systemMessages.join('\n\n') }]
-      };
-    }
+  }
 
-    const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/'
-      + encodeURIComponent(model) + ':generateContent';
-    const upstream = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': geminiKey
-      },
-      body: JSON.stringify(requestBody),
-      signal: AbortSignal.timeout(40000)
-    });
+  const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/'
+    + encodeURIComponent(model) + ':generateContent';
 
-    const raw = await upstream.text();
-    let data = {};
-    try { data = JSON.parse(raw); } catch (_) {}
-    const reply = data && data.candidates && data.candidates[0]
-      && data.candidates[0].content && Array.isArray(data.candidates[0].content.parts)
-      ? data.candidates[0].content.parts.map(part => part && part.text || '').join('')
-      : '';
+  // Retry only temporary rate-limit/overload responses once.
+  const maxAttempts = 2;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const upstream = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': geminiKey
+        },
+        body: JSON.stringify(requestBody),
+        signal: AbortSignal.timeout(35000)
+      });
 
-    if (!upstream.ok || typeof reply !== 'string' || !reply.trim()) {
+      const raw = await upstream.text();
+      let data = {};
+      try { data = JSON.parse(raw); } catch (_) {}
+
+      const reply = data && data.candidates && data.candidates[0]
+        && data.candidates[0].content && Array.isArray(data.candidates[0].content.parts)
+        ? data.candidates[0].content.parts.map(part => part && part.text || '').join('')
+        : '';
+
+      if (upstream.ok && typeof reply === 'string' && reply.trim()) {
+        return res.json({ ok: true, reply: reply.trim() });
+      }
+
       const providerMessage = data && data.error && data.error.message
         ? data.error.message
         : (data && data.promptFeedback && data.promptFeedback.blockReason)
           ? 'Prompt blocked: ' + data.promptFeedback.blockReason
           : 'empty response';
+
       console.error('AI provider error', upstream.status, String(providerMessage).slice(0, 240));
+
+      if ((upstream.status === 429 || upstream.status === 503) && attempt < maxAttempts) {
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        continue;
+      }
+
       return res.status(502).json({
         ok: false,
         error: upstream.status === 401 || upstream.status === 403
           ? 'ai_key_invalid'
           : upstream.status === 404
             ? 'ai_model_or_endpoint_not_found'
-            : 'ai_provider_error'
+            : upstream.status === 429 || upstream.status === 503
+              ? 'ai_provider_busy'
+              : 'ai_provider_error'
+      });
+    } catch (e) {
+      const message = String((e && e.message) || e);
+      console.error('AI proxy error:', message.slice(0, 180));
+      return res.status(502).json({
+        ok: false,
+        error: /timeout|aborted/i.test(message) ? 'ai_provider_timeout' : 'ai_upstream_unreachable'
       });
     }
-
-    return res.json({ ok: true, reply: reply.trim() });
-  } catch (e) {
-    console.error('AI proxy error:', String((e && e.message) || e).slice(0, 180));
-    return res.status(502).json({ ok: false, error: 'ai_upstream_unreachable' });
   }
+  return res.status(502).json({ ok: false, error: 'ai_provider_busy' });
 });
 
 app.listen(PORT,'0.0.0.0',()=>console.log('ORVIX Gmail IMAP bridge listening on '+PORT));
